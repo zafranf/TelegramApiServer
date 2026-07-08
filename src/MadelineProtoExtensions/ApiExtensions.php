@@ -375,6 +375,9 @@ final class ApiExtensions
         string $caption = '',
         ?int $topicId = null,
         string $mediaKind = 'document',
+        ?int $width = null,
+        ?int $height = null,
+        ?int $durationSeconds = null,
     ): array {
         $uploadId = \bin2hex(\random_bytes(16));
         $chunkDir = self::getUploadChunkDir() . "/{$uploadId}";
@@ -391,6 +394,9 @@ final class ApiExtensions
                 'caption' => $caption,
                 'topicId' => $topicId,
                 'mediaKind' => $mediaKind,
+                'width' => $width,
+                'height' => $height,
+                'durationSeconds' => $durationSeconds,
                 'createdAt' => \time(),
             ], JSON_THROW_ON_ERROR)
         );
@@ -562,10 +568,20 @@ final class ApiExtensions
 
                 $kind = $meta['mediaKind'] ?? 'document';
                 if ($kind === 'video') {
-                    $media['attributes'][] = [
+                    $videoAttr = [
                         '_' => 'documentAttributeVideo',
                         'supports_streaming' => true,
                     ];
+                    if (!empty($meta['durationSeconds'])) {
+                        $videoAttr['duration'] = (int)$meta['durationSeconds'];
+                    }
+                    if (!empty($meta['width'])) {
+                        $videoAttr['w'] = (int)$meta['width'];
+                    }
+                    if (!empty($meta['height'])) {
+                        $videoAttr['h'] = (int)$meta['height'];
+                    }
+                    $media['attributes'][] = $videoAttr;
                 } elseif ($kind === 'audio') {
                     $media['attributes'][] = [
                         '_' => 'documentAttributeAudio',
