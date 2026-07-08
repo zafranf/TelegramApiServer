@@ -289,6 +289,70 @@ final class ApiExtensions
         ];
     }
 
+    /**
+     * Single-pass stream upload: file goes directly from HTTP request
+     * to Telegram DC via uploadFromStream, then sendMedia.
+     *
+     * POST /api/uploadStreamSend (multipart: fields then file)
+     */
+    public function uploadStreamSend(
+        API $madelineProto,
+        ReadableStream $file,
+        string $peer,
+        string $fileName,
+        string $mimeType,
+        string $mediaKind = 'document',
+        string $caption = '',
+        ?int $topicId = null,
+        ?int $width = null,
+        ?int $height = null,
+        ?int $duration = null,
+    ): array {
+        $inputFile = $madelineProto->uploadFromStream(
+            stream: $file,
+            size: 0,
+            mime: $mimeType,
+            fileName: $fileName,
+        );
+
+        $media = [
+            '_' => 'inputMediaUploadedDocument',
+            'file' => $inputFile,
+            'attributes' => [
+                ['_' => 'documentAttributeFilename', 'file_name' => $fileName],
+            ],
+        ];
+
+        if ($mediaKind === 'video') {
+            $videoAttr = [
+                '_' => 'documentAttributeVideo',
+                'supports_streaming' => true,
+            ];
+            if ($duration) $videoAttr['duration'] = $duration;
+            if ($width) $videoAttr['w'] = $width;
+            if ($height) $videoAttr['h'] = $height;
+            $media['attributes'][] = $videoAttr;
+        } elseif ($mediaKind === 'audio') {
+            $media['attributes'][] = ['_' => 'documentAttributeAudio'];
+        } elseif ($mediaKind === 'image') {
+            $media['force_file'] = true;
+        }
+
+        $sendParams = [
+            'peer' => $peer,
+            'media' => $media,
+            'message' => $caption,
+        ];
+        if ($topicId) {
+            $sendParams['reply_to'] = [
+                '_' => 'inputReplyToMessage',
+                'reply_to_msg_id' => $topicId,
+            ];
+        }
+
+        return $madelineProto->messages->sendMedia(...$sendParams);
+    }
+
     public function setEventHandler(API $madelineProto): void
     {
         Client::getWrapper($madelineProto)->getAPI()->setEventHandler(EventHandler::class);

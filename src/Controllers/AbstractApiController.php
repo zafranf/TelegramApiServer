@@ -109,8 +109,8 @@ abstract class AbstractApiController
                     if ($field->isFile()) {
                         if ($field->getName() === 'file') {
                             $params[$field->getName()] = $field;
-                            $params['fileName'] = $field->getFilename();
-                            $params['mimeType'] = $field->getMimeType();
+                            $params['fileName'] ??= $field->getFilename();
+                            $params['mimeType'] ??= $field->getMimeType();
                             break;
                         }
                         $params[$field->getName()] = new ReadableBuffer($field->buffer());
