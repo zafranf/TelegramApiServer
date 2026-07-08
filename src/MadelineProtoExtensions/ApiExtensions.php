@@ -2,9 +2,9 @@
 
 namespace TelegramApiServer\MadelineProtoExtensions;
 
+use Amp\ByteStream\Pipe;
 use Amp\ByteStream\ReadableBuffer;
 use Amp\ByteStream\ReadableStream;
-use Amp\ByteStream\WritableBuffer;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\Response;
 use AssertionError;
@@ -492,7 +492,7 @@ final class ApiExtensions
         $chunkSize = 4 * 1024 * 1024;
         $fileSize = $meta['fileSize'];
 
-        $writable = new WritableBuffer();
+        $pipe = new Pipe(65536);
         $response = new Response(
             status: 200,
             headers: [
@@ -500,13 +500,14 @@ final class ApiExtensions
                 'Cache-Control' => 'no-cache',
                 'X-Accel-Buffering' => 'no',
             ],
-            body: $writable,
+            body: $pipe->getSource(),
         );
 
-        $sseWrite = function (array $data) use ($writable): void {
-            if ($writable->isWritable()) {
+        $sink = $pipe->getSink();
+        $sseWrite = function (array $data) use ($sink): void {
+            if ($sink->isWritable()) {
                 try {
-                    $writable->write('data: ' . \json_encode($data) . "\n\n");
+                    $sink->write('data: ' . \json_encode($data) . "\n\n");
                 } catch (\Throwable) {
                     // client disconnected
                 }
@@ -514,7 +515,7 @@ final class ApiExtensions
         };
 
         EventLoop::queue(function () use (
-            $writable, $chunkDir, $meta, $chunkSize, $fileSize, $madelineProto, $sseWrite
+            $sink, $chunkDir, $meta, $chunkSize, $fileSize, $madelineProto, $sseWrite
         ) {
             try {
                 $sseWrite(['event' => 'phase', 'phase' => 'upload']);
@@ -595,14 +596,14 @@ final class ApiExtensions
                     'event' => 'complete',
                     'result' => $result,
                 ]);
-                $writable->end();
+                $sink->end();
 
             } catch (\Throwable $e) {
                 $sseWrite([
                     'event' => 'error',
                     'error' => $e->getMessage(),
                 ]);
-                $writable->end();
+                $sink->end();
             }
         });
 
