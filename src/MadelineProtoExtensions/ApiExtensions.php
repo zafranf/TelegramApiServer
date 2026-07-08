@@ -507,7 +507,9 @@ final class ApiExtensions
         $sseWrite = function (array $data) use ($sink): void {
             if ($sink->isWritable()) {
                 try {
-                    $sink->write('data: ' . \json_encode($data) . "\n\n");
+                    $encoded = \json_encode($data, JSON_INVALID_UTF8_SUBSTITUTE | JSON_UNESCAPED_UNICODE);
+                    if ($encoded === false) return;
+                    $sink->write('data: ' . $encoded . "\n\n");
                 } catch (\Throwable) {
                     // client disconnected
                 }
@@ -596,7 +598,6 @@ final class ApiExtensions
 
                 $sseWrite([
                     'event' => 'complete',
-                    'result' => $result,
                 ]);
                 $sink->end();
 
