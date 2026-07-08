@@ -587,8 +587,10 @@ final class ApiExtensions
 
                 $result = $madelineProto->messages->sendMedia(...$sendParams);
 
-                foreach (\glob("{$chunkDir}/*") ?: [] as $f) {
-                    if (\is_file($f)) \unlink($f);
+                $di = new \RecursiveDirectoryIterator($chunkDir, \FilesystemIterator::SKIP_DOTS);
+                $ri = new \RecursiveIteratorIterator($di, \RecursiveIteratorIterator::CHILD_FIRST);
+                foreach ($ri as $f) {
+                    $f->isDir() ? \rmdir((string)$f) : \unlink((string)$f);
                 }
                 \rmdir($chunkDir);
 
