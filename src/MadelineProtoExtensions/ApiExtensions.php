@@ -449,7 +449,7 @@ final class ApiExtensions
         $files = \glob("{$chunkDir}/*.part") ?: [];
         $indices = [];
         foreach ($files as $f) {
-            $basename = \basename($f);
+            $basename = \pathinfo($f, \PATHINFO_FILENAME);
             if (\is_numeric($basename)) {
                 $indices[] = (int)$basename;
             }
