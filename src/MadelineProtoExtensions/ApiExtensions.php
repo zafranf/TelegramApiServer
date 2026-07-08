@@ -2,18 +2,24 @@
 
 namespace TelegramApiServer\MadelineProtoExtensions;
 
+use Amp\ByteStream\ReadableBuffer;
 use Amp\ByteStream\ReadableStream;
+use Amp\ByteStream\WritableBuffer;
 use Amp\Http\Server\Request;
 use Amp\Http\Server\Response;
 use AssertionError;
 use danog\MadelineProto\API;
 use danog\MadelineProto\EventHandler\Message;
+use danog\MadelineProto\FileCallback;
 use danog\MadelineProto\FileCallbackInterface;
+use danog\MadelineProto\LocalFile;
 use danog\MadelineProto\StrTools;
 use InvalidArgumentException;
+use Revolt\EventLoop;
 use TelegramApiServer\Client;
 use TelegramApiServer\EventObservers\EventHandler;
 use TelegramApiServer\Exceptions\NoMediaException;
+use function Amp\async;
 use function Amp\delay;
 
 final class ApiExtensions
@@ -341,4 +347,266 @@ final class ApiExtensions
             'current_update_loops' => \count(Client::getWrapper($madelineProto)->getAPI()->feeders),
         ];
     }
+
+    // ──────────────────────────────────────────────
+    // Direct chunked upload + send to Telegram
+    // ──────────────────────────────────────────────
+
+    private static function getUploadChunkDir(): string
+    {
+        $dir = ROOT_DIR . '/upload-chunks';
+        if (!is_dir($dir)) {
+            mkdir($dir, 0755, true);
+        }
+        return $dir;
+    }
+
+    /**
+     * Initiate a chunked upload session.
+     * POST /api/uploadChunkInit
+     */
+    public function uploadChunkInit(
+        API $madelineProto,
+        string $peer,
+        int $fileSize,
+        string $mimeType,
+        int $totalChunks,
+        string $fileName,
+        string $caption = '',
+        ?int $topicId = null,
+        string $mediaKind = 'document',
+    ): array {
+        $uploadId = \bin2hex(\random_bytes(16));
+        $chunkDir = self::getUploadChunkDir() . "/{$uploadId}";
+        \mkdir($chunkDir, 0755, true);
+
+        \file_put_contents(
+            "{$chunkDir}/.meta.json",
+            \json_encode([
+                'peer' => $peer,
+                'fileSize' => $fileSize,
+                'mimeType' => $mimeType,
+                'totalChunks' => $totalChunks,
+                'fileName' => $fileName,
+                'caption' => $caption,
+                'topicId' => $topicId,
+                'mediaKind' => $mediaKind,
+                'createdAt' => \time(),
+            ], JSON_THROW_ON_ERROR)
+        );
+
+        return [
+            'uploadId' => $uploadId,
+            'chunkSize' => 4 * 1024 * 1024,
+        ];
+    }
+
+    /**
+     * Upload a single chunk.
+     * POST /api/uploadChunk (multipart: uploadId, chunkIndex, file)
+     */
+    public function uploadChunk(
+        API $madelineProto,
+        string $uploadId,
+        int $chunkIndex,
+        ?ReadableStream $file = null,
+        ?int $totalChunks = null,
+        ?string $filename = null,
+        ?string $fileName = null,
+        ?string $mimeType = null,
+    ): array {
+        $chunkDir = self::getUploadChunkDir() . "/{$uploadId}";
+        if (!\is_dir($chunkDir)) {
+            throw new \InvalidArgumentException("Upload session not found: {$uploadId}");
+        }
+
+        $chunkPath = "{$chunkDir}/{$chunkIndex}.part";
+        if ($file) {
+            $content = $file->buffer();
+            \file_put_contents($chunkPath, $content);
+        }
+
+        return [
+            'received' => true,
+            'chunkIndex' => $chunkIndex,
+        ];
+    }
+
+    /**
+     * Check status of a chunked upload (for resume).
+     * POST /api/uploadChunkStatus
+     */
+    public function uploadChunkStatus(
+        API $madelineProto,
+        string $uploadId,
+        ?int $totalChunks = null,
+    ): array {
+        $chunkDir = self::getUploadChunkDir() . "/{$uploadId}";
+        if (!\is_dir($chunkDir)) {
+            return ['contiguousUploadedChunks' => 0, 'uploadedChunks' => []];
+        }
+
+        $files = \glob("{$chunkDir}/*.part") ?: [];
+        $indices = [];
+        foreach ($files as $f) {
+            $basename = \basename($f);
+            if (\is_numeric($basename)) {
+                $indices[] = (int)$basename;
+            }
+        }
+        \sort($indices);
+
+        $contiguous = 0;
+        foreach ($indices as $i) {
+            if ($i === $contiguous) {
+                $contiguous++;
+            } else {
+                break;
+            }
+        }
+
+        return [
+            'contiguousUploadedChunks' => $contiguous,
+            'uploadedChunks' => $indices,
+        ];
+    }
+
+    /**
+     * Finalise chunked upload: stream to Telegram via uploadFromCallable,
+     * then send media message. Returns SSE stream with progress.
+     * POST /api/uploadChunkComplete
+     */
+    public function uploadChunkComplete(
+        API $madelineProto,
+        Request $request,
+        string $uploadId,
+    ): Response {
+        $chunkDir = self::getUploadChunkDir() . "/{$uploadId}";
+        $metaPath = "{$chunkDir}/.meta.json";
+
+        if (!\is_file($metaPath)) {
+            throw new \InvalidArgumentException("Upload session not found: {$uploadId}");
+        }
+
+        $meta = \json_decode(\file_get_contents($metaPath), true);
+        $chunkSize = 4 * 1024 * 1024;
+        $fileSize = $meta['fileSize'];
+
+        $writable = new WritableBuffer();
+        $response = new Response(
+            status: 200,
+            headers: [
+                'Content-Type' => 'text/event-stream',
+                'Cache-Control' => 'no-cache',
+                'X-Accel-Buffering' => 'no',
+            ],
+            body: $writable,
+        );
+
+        $sseWrite = function (array $data) use ($writable): void {
+            if ($writable->isWritable()) {
+                try {
+                    $writable->write('data: ' . \json_encode($data) . "\n\n");
+                } catch (\Throwable) {
+                    // client disconnected
+                }
+            }
+        };
+
+        EventLoop::queue(function () use (
+            $writable, $chunkDir, $meta, $chunkSize, $fileSize, $madelineProto, $sseWrite
+        ) {
+            try {
+                $sseWrite(['event' => 'phase', 'phase' => 'upload']);
+
+                $inputFile = $madelineProto->uploadFromCallable(
+                    callable: function (int $offset, int $size) use ($chunkDir, $chunkSize, $fileSize, $sseWrite): string {
+                        $chunkIndex = \intdiv($offset, $chunkSize);
+                        $chunkPath = "{$chunkDir}/{$chunkIndex}.part";
+
+                        if (!\is_file($chunkPath)) {
+                            throw new \RuntimeException("Chunk {$chunkIndex} not found at offset {$offset}");
+                        }
+
+                        $data = \file_get_contents($chunkPath, offset: $offset % $chunkSize, length: $size);
+                        if ($data === false || $data === '') {
+                            throw new \RuntimeException("Failed to read chunk {$chunkIndex}");
+                        }
+
+                        $pct = (int)((($offset + \strlen($data)) / $fileSize) * 100);
+                        $sseWrite([
+                            'event' => 'progress',
+                            'progress' => \min(99, $pct),
+                            'uploaded' => $offset + \strlen($data),
+                            'total' => $fileSize,
+                        ]);
+
+                        return $data;
+                    },
+                    size: $fileSize,
+                    mime: $meta['mimeType'],
+                );
+
+                $sseWrite(['event' => 'phase', 'phase' => 'sending']);
+
+                $media = [
+                    '_' => 'inputMediaUploadedDocument',
+                    'file' => $inputFile,
+                    'attributes' => [
+                        ['_' => 'documentAttributeFilename', 'file_name' => $meta['fileName']],
+                    ],
+                ];
+
+                $kind = $meta['mediaKind'] ?? 'document';
+                if ($kind === 'video') {
+                    $media['attributes'][] = [
+                        '_' => 'documentAttributeVideo',
+                        'supports_streaming' => true,
+                    ];
+                } elseif ($kind === 'audio') {
+                    $media['attributes'][] = [
+                        '_' => 'documentAttributeAudio',
+                    ];
+                } elseif ($kind === 'image') {
+                    $media['force_file'] = true;
+                }
+
+                $sendParams = [
+                    'peer' => $meta['peer'],
+                    'media' => $media,
+                    'message' => $meta['caption'] ?? '',
+                ];
+
+                if (!empty($meta['topicId']) && $meta['topicId'] > 0) {
+                    $sendParams['reply_to'] = [
+                        '_' => 'inputReplyToMessage',
+                        'reply_to_msg_id' => $meta['topicId'],
+                    ];
+                }
+
+                $result = $madelineProto->messages->sendMedia(...$sendParams);
+
+                foreach (\glob("{$chunkDir}/*") ?: [] as $f) {
+                    if (\is_file($f)) \unlink($f);
+                }
+                \rmdir($chunkDir);
+
+                $sseWrite([
+                    'event' => 'complete',
+                    'result' => $result,
+                ]);
+                $writable->end();
+
+            } catch (\Throwable $e) {
+                $sseWrite([
+                    'event' => 'error',
+                    'error' => $e->getMessage(),
+                ]);
+                $writable->end();
+            }
+        });
+
+        return $response;
+    }
+
 }
